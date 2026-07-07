@@ -15,10 +15,7 @@ RATE_LIMIT = 18
 RATE_WINDOW = 10  # seconds
 
 # --- Data Stores ---
-# 1. Pre-generated catalog of exactly 46 orders for pagination
 CATALOG = [{"id": i, "description": f"Order #{i}"} for i in range(1, TOTAL_ORDERS + 1)]
-
-# 2. In-memory store for idempotency keys
 IDEMPOTENCY_STORE = {}
 
 app = FastAPI()
@@ -34,47 +31,51 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         
         if client_id:
             now = time.time()
-            # Clean up requests older than 10 seconds
+            
+            # 1. Add current request FIRST to prevent async parallel race conditions
+            self.clients[client_id].append(now)
+            
+            # 2. Clean up requests older than the window
             self.clients[client_id] = [
                 t for t in self.clients[client_id] if now - t < RATE_WINDOW
             ]
             
-            # Check if bucket limit is reached
-            if len(self.clients[client_id]) >= RATE_LIMIT:
-                # Calculate how long until the oldest request in the window expires
+            # 3. Check if bucket limit is reached (using > because we already appended)
+            if len(self.clients[client_id]) > RATE_LIMIT:
                 oldest_request = self.clients[client_id][0]
                 retry_after = int(RATE_WINDOW - (now - oldest_request)) + 1
                 
+                # Fix: Manually inject CORS headers on intercepted responses 
+                origin = request.headers.get("origin", "*")
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "Too Many Requests"},
-                    headers={"Retry-After": str(max(1, retry_after))}
+                    headers={
+                        "Retry-After": str(max(1, retry_after)),
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Expose-Headers": "Retry-After"
+                    }
                 )
-                
-            # Log this request's timestamp
-            self.clients[client_id].append(now)
 
         return await call_next(request)
 
-# Register Middlewares (Order matters: CORS Outer, Rate Limiter Inner)
+# Register Middlewares 
 app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows grader's browser to execute the fetch
-    allow_credentials=True,
+    allow_origins=["*"], 
+    allow_credentials=False, # Changed to False to prevent wildcard (*) conflicts
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Retry-After"] # Crucial: Let the browser read the 429 Retry-After header
+    expose_headers=["Retry-After"]
 )
 
 # --- Endpoint 1: Cursor Pagination ---
 def encode_cursor(index: int) -> str:
-    """Creates an opaque base64 cursor from an index."""
     return base64.urlsafe_b64encode(str(index).encode()).decode()
 
 def decode_cursor(cursor: str) -> int:
-    """Decodes the opaque base64 cursor back to an index."""
     try:
         return int(base64.urlsafe_b64decode(cursor.encode()).decode())
     except Exception:
@@ -82,14 +83,11 @@ def decode_cursor(cursor: str) -> int:
 
 @app.get("/orders")
 async def get_orders(limit: int = 10, cursor: Optional[str] = None):
-    # Determine starting index from cursor
     start_idx = decode_cursor(cursor) if cursor else 0
     end_idx = start_idx + limit
     
-    # Slice the catalog
     items = CATALOG[start_idx:end_idx]
     
-    # Determine the next cursor
     next_cursor = None
     if end_idx < TOTAL_ORDERS:
         next_cursor = encode_cursor(end_idx)
@@ -111,20 +109,16 @@ async def create_order(
             content={"detail": "Idempotency-Key header is missing."}
         )
 
-    # Check if key already exists
     if idempotency_key in IDEMPOTENCY_STORE:
-        # Return the EXACT SAME object that was generated the first time
-        response.status_code = 200 # Standard practice for returning cached idempotent entity
+        response.status_code = 200
         return IDEMPOTENCY_STORE[idempotency_key]
         
-    # Generate a new unique order
     new_order = {
         "id": str(uuid.uuid4()),
         "status": "created",
         "timestamp": time.time()
     }
     
-    # Store it linked to the key
     IDEMPOTENCY_STORE[idempotency_key] = new_order
     
     return new_order
